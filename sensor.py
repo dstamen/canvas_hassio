@@ -173,6 +173,41 @@ class CanvasHomeworkEventSensor(CanvasSensor):
 
         self._loaded_from_storage = False
 
+    @staticmethod
+    def _submission_is_complete(submission) -> bool:
+        """Whether a submission counts as completed work.
+
+        Canvas reports auto-marked quizzes as workflow_state "graded" (never
+        "submitted"), so testing only for "submitted" misses them entirely.
+        A grade or score present is also decisive on its own.
+        """
+        workflow_state = getattr(submission, 'workflow_state', None)
+        submitted_at = getattr(submission, 'submitted_at', None)
+        grade = getattr(submission, 'grade', None)
+        score = getattr(submission, 'score', None)
+
+        if workflow_state in ('submitted', 'graded', 'pending_review') and submitted_at:
+            return True
+        if grade is not None and grade != '':
+            return True
+        if score is not None:
+            return True
+        return False
+
+    @classmethod
+    def _pending_only(cls, assignments, submissions):
+        """Assignments with no completed submission."""
+        completed_ids = {
+            str(getattr(submission, 'assignment_id', ''))
+            for submission in submissions
+            if cls._submission_is_complete(submission)
+        }
+        completed_ids.discard('')
+        return [
+            assignment for assignment in assignments
+            if str(getattr(assignment, 'id', '')) not in completed_ids
+        ]
+
     async def async_update(self) -> None:
         """Fetch new state data and fire events for homework changes."""
         try:
@@ -186,8 +221,15 @@ class CanvasHomeworkEventSensor(CanvasSensor):
             # Get current data with validation
             current_students = await self._hub.poll_observees() or []
             current_courses = await self._hub.poll_courses() or []
-            current_assignments = await self._hub.poll_pending_assignments() or []
+            current_all_assignments = await self._hub.poll_assignments() or []
             current_submissions = await self._hub.poll_submissions() or []
+            if not isinstance(current_all_assignments, list):
+                _LOGGER.warning(f"Invalid assignments data type: {type(current_all_assignments)}")
+                current_all_assignments = []
+            if not isinstance(current_submissions, list):
+                _LOGGER.warning(f"Invalid submissions data type: {type(current_submissions)}")
+                current_submissions = []
+            current_assignments = self._pending_only(current_all_assignments, current_submissions)
 
             # Validate API responses
             if not isinstance(current_students, list):
@@ -207,10 +249,12 @@ class CanvasHomeworkEventSensor(CanvasSensor):
             await self._update_student_info(current_students)
 
             # Create assignment to student mapping
-            assignment_to_student = await self._create_assignment_student_mapping(current_courses, current_assignments)
+            assignment_to_student = await self._create_assignment_student_mapping(current_courses, current_all_assignments)
 
-            # Group assignments and submissions by student
-            assignments_by_student = self._group_by_student(current_assignments, assignment_to_student)
+            # Group assignments and submissions by student. Completion detection needs
+            # the FULL assignment list: a completed assignment is by definition absent
+            # from the pending list, so grouping pending-only made it undetectable.
+            assignments_by_student = self._group_by_student(current_all_assignments, assignment_to_student)
             submissions_by_student = self._group_submissions_by_student(current_submissions, assignment_to_student)
 
             # Check for new assignments and completed homework per student
@@ -369,7 +413,7 @@ class CanvasHomeworkEventSensor(CanvasSensor):
                 workflow_state = getattr(submission, 'workflow_state', None)
                 submitted_at = getattr(submission, 'submitted_at', None)
 
-                if workflow_state == 'submitted' and submitted_at:
+                if self._submission_is_complete(submission):
                     self._completed_assignment_ids_per_student[student_id].add(assignment_id)
 
                     # Fire homework completed event with student information
