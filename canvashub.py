@@ -53,6 +53,23 @@ class CanvasHub(DataUpdateCoordinator):
         async with sem:
             return await self._client.submissions(student_id,course_id)
 
+    @staticmethod
+    def _drop_failed(results, label):
+        """Keep successful per-course results, log and skip the failures.
+
+        Observers are enrolled in unpublished course shells that Canvas
+        refuses to describe (403 "user not authorized"). Without this, a
+        single such course aborts the whole gather and discards every
+        other course's data.
+        """
+        kept = []
+        for result in results:
+            if isinstance(result, BaseException):
+                _LOGGER.warning("Skipping %s for an inaccessible course: %s", label, result)
+                continue
+            kept.append(result)
+        return kept
+
     async def poll_observees(self) -> list[dict]:
         """Get Canvas Observees (students)."""
         return await self.get_students()
@@ -77,7 +94,8 @@ class CanvasHub(DataUpdateCoordinator):
             observee = course.enrollments[0]
             if observee is not None:
                 assignment_tasks.append(asyncio.create_task(self.get_assignments(observee.get("user_id", ""), course.id, self._semaphore)))
-        assignment_results = await asyncio.gather(*assignment_tasks)
+        assignment_results = await asyncio.gather(*assignment_tasks, return_exceptions=True)
+        assignment_results = self._drop_failed(assignment_results, "assignments")
         assignments.extend(
             [Assignment(assignment) for assignment in itertools.chain.from_iterable(assignment_results)]
         )
@@ -129,7 +147,8 @@ class CanvasHub(DataUpdateCoordinator):
             observee = course.enrollments[0]
             if observee is not None:
                 submission_tasks.append(asyncio.create_task(self.get_submissions(observee.get("user_id", ""), course.id, self._semaphore)))
-        submission_results = await asyncio.gather(*submission_tasks)
+        submission_results = await asyncio.gather(*submission_tasks, return_exceptions=True)
+        submission_results = self._drop_failed(submission_results, "submissions")
         submissions.extend(
             [Submission(submission) for submission in itertools.chain.from_iterable(submission_results)]
         )
